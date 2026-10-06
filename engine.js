@@ -84,8 +84,16 @@
     if (self.liberties === 0) return { ok: false, reason: "suicide" };
 
     let nextKo = null;
-    if (captured.length === 1 && self.liberties === 1 && self.libertyKeys.has(captured[0][0] + "," + captured[0][1])) {
-      nextKo = { x: captured[0][0], y: captured[0][1] };
+    const back = captured[0];
+    // 只有提回的仍是一子，才算劫。提回一整块是倒扑，可以马上下。
+    if (
+      captured.length === 1
+      && self.group.length === 1
+      && self.liberties === 1
+      && back
+      && self.libertyKeys.has(back[0] + "," + back[1])
+    ) {
+      nextKo = { x: back[0], y: back[1] };
     }
     return {
       ok: true,
@@ -148,22 +156,114 @@
     return { kind, bestCapture, moveCount: moves.length };
   }
 
-  function botMove(board, color, ko) {
+  function ownEscapes(board, color, moves) {
+    const escapes = [];
+    const seen = new Set();
+    for (let y = 0; y < board.length; y += 1) {
+      for (let x = 0; x < board.length; x += 1) {
+        if (board[y][x] !== color) continue;
+        const id = x + "," + y;
+        if (seen.has(id)) continue;
+        const group = groupAt(board, x, y);
+        for (const [gx, gy] of group.group) seen.add(gx + "," + gy);
+        if (group.liberties !== 1) continue;
+        const liberty = Array.from(group.libertyKeys)[0];
+        for (const move of moves) {
+          if (move.x + "," + move.y === liberty) escapes.push(move);
+        }
+      }
+    }
+    return escapes;
+  }
+
+  function groupsOf(board, color) {
+    const seen = new Set();
+    const out = [];
+    for (let y = 0; y < board.length; y += 1) {
+      for (let x = 0; x < board.length; x += 1) {
+        if (board[y][x] !== color || seen.has(x + "," + y)) continue;
+        const group = groupAt(board, x, y);
+        for (const [gx, gy] of group.group) seen.add(gx + "," + gy);
+        out.push(group);
+      }
+    }
+    return out;
+  }
+
+  function hintMove(board, color, ko) {
     const moves = legalMoves(board, color, ko);
     if (!moves.length) return null;
     const size = board.length;
+    const opponent = color === BLACK ? WHITE : BLACK;
+    const hasOwn = board.some((row) => row.some((value) => value === color));
+    const beforeLow = groupsOf(board, opponent).reduce((low, group) => Math.min(low, group.liberties), 99);
+    let best = null;
+    let bestKey = null;
+    let bestKind = "steady";
+    for (const move of moves) {
+      let saved = 0;
+      let touchOwn = 0;
+      for (const [nx, ny] of neighbors(move.x, move.y, size)) {
+        if (board[ny][nx] !== color) continue;
+        touchOwn += 1;
+        const group = groupAt(board, nx, ny);
+        if (group.liberties === 1 && group.libertyKeys.has(move.x + "," + move.y)) saved += group.group.length;
+      }
+      let lowest = 99;
+      let atariStones = 0;
+      for (const group of groupsOf(move.board, opponent)) {
+        if (group.liberties < lowest) lowest = group.liberties;
+        if (group.liberties === 1) atariStones += group.group.length;
+      }
+      const selfAtari = move.liberties === 1 && move.captured === 0 ? 1 : 0;
+      const eye = isEye(board, move.x, move.y, color) ? 1 : 0;
+      const chase = lowest < beforeLow && !selfAtari ? (atariStones ? atariStones * 10 : 1) : 0;
+      const corner = !hasOwn && size >= 7 && move.x === 2 && move.y === 2 ? 1 : 0;
+      const key = [move.captured, saved, chase, -selfAtari, -eye, corner, touchOwn, move.liberties];
+      let better = !bestKey;
+      if (!better) {
+        for (let i = 0; i < key.length; i += 1) {
+          if (key[i] === bestKey[i]) continue;
+          better = key[i] > bestKey[i];
+          break;
+        }
+      }
+      if (!better) continue;
+      bestKey = key;
+      best = move;
+      if (move.captured > 0) bestKind = "capture";
+      else if (saved > 0) bestKind = "save";
+      else if (atariStones > 0 && chase > 0) bestKind = "atari";
+      else if (chase > 0) bestKind = "chase";
+      else if (corner) bestKind = "corner";
+      else if (touchOwn) bestKind = "connect";
+      else bestKind = "steady";
+    }
+    return best ? { x: best.x, y: best.y, kind: bestKind } : null;
+  }
+
+  function botMove(board, color, ko, style) {
+    let moves = legalMoves(board, color, ko);
+    if (!moves.length) return null;
+    const size = board.length;
     const center = (size - 1) / 2;
+    if (style === "miss") {
+      const escapes = ownEscapes(board, color, moves);
+      const escapeKeys = new Set(escapes.map((move) => move.x + "," + move.y));
+      const stayed = moves.filter((move) => !escapeKeys.has(move.x + "," + move.y));
+      if (stayed.length) moves = stayed;
+    }
     let best = null;
     let bestScore = -1e9;
     for (const move of moves) {
-      let score = move.captured * 140 + move.liberties * 3;
+      let score = move.captured * (style === "link" ? 40 : 140) + move.liberties * 3;
       if (move.liberties === 1 && move.captured === 0) score -= 55;
       if (isEye(board, move.x, move.y, color)) score -= 100;
       for (const [nx, ny] of neighbors(move.x, move.y, size)) {
         const value = board[ny][nx];
         if (value && value !== color) score += 9;
         if (value === color) {
-          score += 2;
+          score += style === "link" ? 28 : 2;
           const group = groupAt(board, nx, ny);
           if (group.liberties === 1 && group.libertyKeys.has(move.x + "," + move.y)) score += 70;
         }
@@ -190,6 +290,7 @@
     playAt,
     legalMoves,
     advise,
+    hintMove,
     botMove,
   };
 });
